@@ -1,8 +1,8 @@
 
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
-const BUDGET_MS = 3800;
-const SEARCH_MS = 1350;
-const GEMINI_MS = 2250;
+const BUDGET_MS = 4100;
+const SEARCH_MS = 1200;
+const GEMINI_MS = 2800;
 const MAX_TEXT = 900;
 
 const SYSTEM = `Ты умный голосовой помощник в навыке Яндекс Алисы.

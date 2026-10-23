@@ -332,6 +332,55 @@ function fallback(error) {
   return 'Не успела получить ответ от нейросети. Попробуйте ещё раз.';
 }
 
+async function getCurrencyRate(question) {
+  const isUSD = /доллар|usd/i.test(question);
+  const isEUR = /евро|eur/i.test(question);
+
+  if (!isUSD && !isEUR) return null;
+
+  const code = isEUR ? 'EUR' : 'USD';
+  const name = isEUR ? 'евро' : 'доллар';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1700);
+
+  try {
+    const response = await fetch(
+      'https://www.cbr.ru/scripts/XML_daily.asp',
+      { signal: controller.signal }
+    );
+
+    if (!response.ok) throw new Error('CBR_HTTP_' + response.status);
+
+    const xml = await response.text();
+
+    const block = [...xml.matchAll(/<Valute\b[^>]*>([\s\S]*?)<\/Valute>/g)]
+      .map(x => x[1])
+      .find(x => x.includes(`<CharCode>${code}</CharCode>`));
+
+    if (!block) throw new Error('CURRENCY_NOT_FOUND');
+
+    const value = block.match(/<Value>([\d,]+)<\/Value>/)?.[1];
+    const nominal = block.match(/<Nominal>(\d+)<\/Nominal>/)?.[1];
+    const date = xml.match(/<ValCurs[^>]*Date="([^"]+)"/)?.[1];
+
+    if (!value || !nominal || !date) {
+      throw new Error('CBR_INVALID_RESPONSE');
+    }
+
+    const rate = Number(value.replace(',', '.')) / Number(nominal);
+
+    if (!Number.isFinite(rate)) throw new Error('INVALID_RATE');
+
+    return `По официальному курсу Центробанка на ${date}, один ${name} стоит ${rate.toFixed(2).replace('.', ',')} рубля.`;
+  } catch (error) {
+    console.warn('CBR error:', error.name, error.message);
+    return 'Не удалось получить актуальный курс Центробанка.';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export default async function handler(req, res) {
   // Проверка доступности сервера
   if (req.method === 'GET') {

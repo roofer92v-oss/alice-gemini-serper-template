@@ -434,8 +434,14 @@ export default async function handler(req, res) {
 
   let answer;
 
-  // Для свежей информации используем Serper
-  if (isSearchIntent(question)) {
+// Для валют используем официальный API Банка России
+if (
+  /курс|сколько стоит/i.test(question) &&
+  /доллар|usd|евро|eur/i.test(question) &&
+  /рубл|rub|курс/i.test(question)
+) {
+  answer = await getCurrencyRate(question);
+} else if (isSearchIntent(question)) {
     const result = await searchWeb(
       question,
       Math.min(

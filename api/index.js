@@ -1,278 +1,345 @@
 
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
-const BUDGET_MS = 4100;
-const SEARCH_MS = 1200;
-const GEMINI_MS = 2800;
-const MAX_TEXT = 900;
+const MODEL = (process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite').trim();
 
-const SYSTEM = `Ты умный голосовой помощник в навыке Яндекс Алисы.
-Отвечай по-русски, естественно и по существу, обычно в 1–3 предложениях.
-Если пользователь просит подробности, объясняй подробнее, но не длиннее 900 символов.
-Учитывай контекст разговора. Не используй Markdown и списки.
-При наличии данных поиска анализируй их, отвечай именно на вопрос,
-а не пересказывай названия сайтов.
-Не выдумывай цифры, даты, прогнозы или события, которых нет в источниках.
-Для курса валют различай официальный и рыночный курсы.
-Если источники недостаточны, скажи об этом.`;
+const TOTAL_MS = 3900;
+const SEARCH_MS = 1100;
+const GEMINI_MS = 2500;
+const DIRECT_MS = 1500;
 
-const clean = x => String(x ?? '').replace(/\s+/g, ' ').trim();
+const SYSTEM = `Ты умный голосовой ИИ-помощник в Яндекс Алисе.
+Говори по-русски, естественно и понятно.
+Обычно отвечай в 1-3 предложениях.
+Если просят подробности, объясняй подробнее.
+Учитывай предыдущие реплики.
+Если предоставлены сведения из интернета, анализируй их,
+а не просто зачитывай заголовки.
+Не придумывай факты, цены, курсы, даты и новости.
+Не используй Markdown.
+Если данных недостаточно, честно сообщи об этом.`;
 
-const trimText = (x, max = MAX_TEXT) => {
+const clean = x => String(x ?? '')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+function short(x, n = 900) {
   const s = clean(x);
-  if (s.length <= max) return s || 'Не удалось подготовить ответ.';
-  return s.slice(0, max - 1).replace(/\s+\S*$/, '') + '…';
-};
-
-const timeLeft = started =>
-  Math.max(0, BUDGET_MS - (Date.now() - started));
-
-function compactHistory(raw) {
-  if (!Array.isArray(raw)) return [];
-
-  return raw
-    .filter(x =>
-      x &&
-      ['user', 'model'].includes(x.role) &&
-      typeof x.text === 'string'
-    )
-    .slice(-4)
-    .map(x => ({
-      role: x.role,
-      text: trimText(x.text, 110)
-    }));
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1)
+    .replace(/\s+\S*$/, '') + '…';
 }
 
-function response(text, history = []) {
-  let stateHistory = compactHistory(history);
+function historyOf(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(x =>
+    x &&
+    ['user', 'model'].includes(x.role) &&
+    typeof x.text === 'string'
+  ).slice(-4).map(x => ({
+    role: x.role,
+    text: short(x.text, 110)
+  }));
+}
+
+function alice(text, history = []) {
+  const h = historyOf(history);
 
   while (
-    Buffer.byteLength(
-      JSON.stringify({ history: stateHistory }),
-      'utf8'
-    ) > 850
-  ) {
-    stateHistory.shift();
-  }
+    h.length &&
+    Buffer.byteLength(JSON.stringify({ history: h }), 'utf8') > 850
+  ) h.shift();
 
   return {
     version: '1.0',
     response: {
-      text: trimText(text),
+      text: short(text),
       end_session: false
     },
-    session_state: {
-      history: stateHistory
-    }
+    session_state: { history: h }
   };
 }
 
-function searchNeeded(question, history) {
-  if (
-    /сегодня|сейчас|вчера|завтра|на этой неделе|последн|свеж|новост|погод|температур|курс|доллар|евро|валют|цен[аыуе]|сколько стоит|бирж|акци|котиров|расписан|результат матч|найди|поищи|поиск|интернет|актуальн|2026|today|latest|current|weather|news/i.test(question)
-  ) {
-    return true;
-  }
-
-  const lastUser = [...history]
-    .reverse()
-    .find(x => x.role === 'user');
-
-  return !!lastUser &&
-    /^(а |и |ну |сколько |какой |что насчёт|а теперь)/i.test(question) &&
-    /погод|курс|новост|цен|котиров|бирж/i.test(lastUser.text);
-}
-
-async function requestJson(url, init, ms) {
+async function timedFetch(url, options = {}, ms = 1000) {
   const controller = new AbortController();
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    Math.max(150, ms)
-  );
+  const timer = setTimeout(() => controller.abort(), ms);
 
   try {
     const r = await fetch(url, {
-      ...init,
+      ...options,
       signal: controller.signal
     });
 
-    const data = await r.json().catch(() => ({}));
-
     if (!r.ok) {
-      throw new Error(`HTTP_${r.status}`);
+      throw new Error('HTTP_' + r.status);
     }
 
-    return data;
+    return r;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function getSearch(question, ms) {
+function needsSearch(q, history) {
+  if (
+    /сегодня|сейчас|вчера|завтра|последн|новост|свеж|актуальн|найди|поищи|интернет|погод|температур|сколько стоит|цен[аыуе]|курс|доллар|евро|расписани|котиров|бирж|результат матча/i.test(q)
+  ) return true;
+
+  const last = [...history].reverse()
+    .find(x => x.role === 'user');
+
+  return !!last &&
+    /^(а |и |сколько |какой |что насчёт)/i.test(q) &&
+    /новост|погод|курс|доллар|евро|цен/i.test(last.text);
+}
+
+function isCurrency(q) {
+  return /доллар|usd|евро|eur/i.test(q) &&
+    /курс|рубл|сколько стоит|центробанк|цб/i.test(q);
+}
+
+async function currency(q) {
+  const code = /евро|eur/i.test(q) ? 'EUR' : 'USD';
+  const name = code === 'USD' ? 'доллар' : 'евро';
+
+  const r = await timedFetch(
+    'https://www.cbr.ru/scripts/XML_daily.asp',
+    {},
+    DIRECT_MS
+  );
+
+  const bytes = await r.arrayBuffer();
+  const xml = new TextDecoder('windows-1251').decode(bytes);
+
+  const blocks = [...xml.matchAll(
+    /<Valute\b[^>]*>([\s\S]*?)<\/Valute>/g
+  )];
+
+  const block = blocks.map(x => x[1]).find(x =>
+    x.includes(`<CharCode>${code}</CharCode>`)
+  );
+
+  if (!block) throw new Error('CBR_CURRENCY_NOT_FOUND');
+
+  const value = block.match(
+    /<Value>([\d,]+)<\/Value>/
+  )?.[1];
+
+  const nominal = block.match(
+    /<Nominal>(\d+)<\/Nominal>/
+  )?.[1];
+
+  const date = xml.match(
+    /<ValCurs[^>]*Date="([^"]+)"/
+  )?.[1];
+
+  const rate = Number(value?.replace(',', '.')) /
+    Number(nominal);
+
+  if (!Number.isFinite(rate) || !date) {
+    throw new Error('CBR_INVALID_DATA');
+  }
+
+  const formatted = rate.toLocaleString('ru-RU', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+
+  return `По официальному курсу Банка России на ${date}, один ${name} стоит ${formatted} рубля. Это курс ЦБ, а не курс покупки или продажи в банке.`;
+}
+
+function weatherCode(code) {
+  if (code === 0) return 'ясно';
+  if ([1, 2].includes(code)) return 'переменная облачность';
+  if (code === 3) return 'пасмурно';
+  if ([45, 48].includes(code)) return 'туман';
+  if ([51, 53, 55, 56, 57].includes(code)) return 'морось';
+  if ([61, 63, 65, 66, 67].includes(code)) return 'дождь';
+  if ([71, 73, 75, 77, 85, 86].includes(code)) return 'снег';
+  if ([80, 81, 82].includes(code)) return 'ливень';
+  if ([95, 96, 99].includes(code)) return 'гроза';
+  return 'погодные условия уточняются';
+}
+
+function isLocalWeather(q) {
+  return /погод|температур|сколько градус|снег|дожд/i.test(q)
+    && /мончегорск/i.test(q);
+}
+
+async function localWeather() {
+  const url = 'https://api.open-meteo.com/v1/forecast?' +
+    new URLSearchParams({
+      latitude: '67.94',
+      longitude: '32.87',
+      current: 'temperature_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m',
+      timezone: 'Europe/Moscow'
+    });
+
+  const r = await timedFetch(url, {}, DIRECT_MS);
+  const data = await r.json();
+  const c = data.current;
+
+  if (!c || !Number.isFinite(c.temperature_2m)) {
+    throw new Error('WEATHER_INVALID_DATA');
+  }
+
+  const t = Math.round(c.temperature_2m);
+  const felt = Math.round(c.apparent_temperature);
+  const wind = Math.round(c.wind_speed_10m);
+
+  return `В Мончегорске сейчас ${t} градусов, ${weatherCode(c.weather_code)}. По ощущениям ${felt}. Ветер около ${wind} километров в час. Данные погодной модели Open-Meteo.`;
+}
+
+function extractSearch(data) {
+  const lines = [];
+
+  if (data.answerBox) {
+    const a = data.answerBox;
+    const value = clean(
+      a.answer || a.snippet || a.title
+    );
+    if (value) lines.push('Быстрый ответ: ' + short(value, 300));
+  }
+
+  if (data.knowledgeGraph?.description) {
+    lines.push(
+      'Справка: ' +
+      short(data.knowledgeGraph.description, 250)
+    );
+  }
+
+  for (const item of (data.organic || []).slice(0, 4)) {
+    lines.push(
+      'Источник: ' + short(item.title, 90) +
+      '. Фрагмент: ' + short(item.snippet, 300) +
+      '. Ссылка: ' + clean(item.link)
+    );
+  }
+
+  return lines.join('\n').slice(0, 1800);
+}
+
+function usefulFallback(data) {
+  const box = clean(
+    data.answerBox?.answer ||
+    data.answerBox?.snippet ||
+    data.knowledgeGraph?.description
+  );
+
+  if (box) {
+    return 'По найденным данным: ' + short(box, 400);
+  }
+
+  const snippets = (data.organic || [])
+    .map(x => clean(x.snippet))
+    .filter(x => x.length > 50)
+    .slice(0, 2);
+
+  if (!snippets.length) {
+    return 'Поиск завершился, но достоверного ответа получить не удалось.';
+  }
+
+  return 'Нашла следующие сведения, но не успела их полностью проверить: ' +
+    snippets.map(x => short(x, 190)).join(' ');
+}
+
+async function serper(q, ms) {
   if (!process.env.SERPER_API_KEY) {
     throw new Error('SERPER_KEY_MISSING');
   }
 
-  const start = Date.now();
-
-  try {
-    const data = await requestJson(
-      'https://google.serper.dev/search',
-      {
-        method: 'POST',
-        headers: {
-          'X-API-KEY': process.env.SERPER_API_KEY,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          q: question,
-          gl: 'ru',
-          hl: 'ru',
-          num: 5
-        })
+  const r = await timedFetch(
+    'https://google.serper.dev/search',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-KEY': process.env.SERPER_API_KEY
       },
-      ms
-    );
+      body: JSON.stringify({
+        q,
+        gl: 'ru',
+        hl: 'ru',
+        num: 4
+      })
+    },
+    ms
+  );
 
-    const entries = [];
-    const answer = data.answerBox;
-
-    if (answer) {
-      entries.push(
-        'Быстрый ответ: ' +
-        clean(
-          answer.answer ||
-          answer.snippet ||
-          answer.title
-        ).slice(0, 350)
-      );
-    }
-
-    if (data.knowledgeGraph?.description) {
-      entries.push(
-        'Справка: ' +
-        clean(data.knowledgeGraph.description).slice(0, 300)
-      );
-    }
-
-    for (const item of (data.organic || []).slice(0, 4)) {
-      if (item?.title || item?.snippet) {
-        entries.push(
-          `Источник: ${clean(item.title).slice(0, 100)}. ` +
-          `Содержание: ${clean(item.snippet).slice(0, 240)}. ` +
-          `URL: ${clean(item.link).slice(0, 160)}`
-        );
-      }
-    }
-
-    console.info(
-      'Serper OK',
-      Date.now() - start,
-      'ms',
-      entries.length,
-      'items'
-    );
-
-    return entries.join('\n').slice(0, 1900);
-  } catch (e) {
-    console.warn(
-      'Serper failure:',
-      e.name,
-      e.message,
-      'after',
-      Date.now() - start,
-      'ms'
-    );
-
-    throw e;
-  }
+  return r.json();
 }
 
-async function getGemini(question, history, searchText, ms) {
+async function gemini(q, history, context, ms) {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error('GEMINI_KEY_MISSING');
   }
 
-  if (!/^[\w.-]+$/.test(MODEL)) {
-    throw new Error('INVALID_MODEL');
+  if (!/^[A-Za-z0-9._-]+$/.test(MODEL)) {
+    throw new Error('INVALID_GEMINI_MODEL');
   }
 
-  const userPrompt = searchText
-    ? `${question}
-
-Ниже сведения из интернета. Сопоставь их и сформулируй
-содержательный ответ, а не список заголовков.
-Не утверждай, что данные проверены на момент запроса,
-если из источника этого не следует.
-
-${searchText}`
-    : question;
-
-  const contents = compactHistory(history).map(x => ({
+  const contents = historyOf(history).map(x => ({
     role: x.role,
     parts: [{ text: x.text }]
   }));
 
+  const prompt = context
+    ? `Вопрос пользователя: ${q}
+
+Данные интернет-поиска:
+${context}
+
+Ответь непосредственно на вопрос.
+Проанализируй фрагменты, не перечисляй сайты.
+Не выдумывай отсутствующие факты.
+Отличай дату статьи от даты события.
+Если найденные фрагменты не подтверждают точное значение,
+скажи об ограничении информации.`
+    : q;
+
   contents.push({
     role: 'user',
-    parts: [{ text: userPrompt }]
+    parts: [{ text: prompt }]
   });
 
-  const start = Date.now();
+  const generationConfig = {
+    temperature: 0.3,
+    maxOutputTokens: 210
+  };
 
-  try {
-    const data = await requestJson(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': process.env.GEMINI_API_KEY
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: SYSTEM }]
-          },
-          contents,
-          generationConfig: {
-            temperature: 0.35,
-            maxOutputTokens: 230
-          }
-        })
-      },
-      ms
-    );
-
-    const text = (
-      data.candidates?.[0]?.content?.parts || []
-    )
-      .map(p => p.text || '')
-      .join('')
-      .trim();
-
-    if (!text) {
-      throw new Error('EMPTY_GEMINI_RESPONSE');
-    }
-
-    console.info(
-      'Gemini OK',
-      Date.now() - start,
-      'ms'
-    );
-
-    return text;
-  } catch (e) {
-    console.warn(
-      'Gemini failure:',
-      e.name,
-      e.message,
-      'after',
-      Date.now() - start,
-      'ms'
-    );
-
-    throw e;
+  // Отключаем лишнее размышление для моделей 2.5
+  if (/^gemini-2\.5-(flash|flash-lite)/.test(MODEL)) {
+    generationConfig.thinkingConfig = {
+      thinkingBudget: 0
+    };
   }
+
+  const r = await timedFetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': process.env.GEMINI_API_KEY
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: SYSTEM }]
+        },
+        contents,
+        generationConfig
+      })
+    },
+    ms
+  );
+
+  const data = await r.json();
+
+  const answer = (
+    data.candidates?.[0]?.content?.parts || []
+  ).map(x => x.text || '').join('').trim();
+
+  if (!answer) throw new Error('GEMINI_EMPTY');
+
+  return answer;
 }
 
 export default async function handler(req, res) {
@@ -280,7 +347,8 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       service: 'alice-gemini-serper',
-      message: 'POST /api'
+      model: MODEL,
+      message: 'Webhook ready'
     });
   }
 
@@ -291,89 +359,121 @@ export default async function handler(req, res) {
   }
 
   const started = Date.now();
+  const remaining = () =>
+    Math.max(0, TOTAL_MS - (Date.now() - started));
 
-  const body =
-    req.body && typeof req.body === 'object'
-      ? req.body
-      : {};
+  const body = req.body && typeof req.body === 'object'
+    ? req.body : {};
 
   const q = clean(
     body.request?.command ||
-    body.request?.original_utterance
+    body.request?.original_utterance ||
+    ''
   ).slice(0, 500);
 
-  const history = compactHistory(
-    body.state?.session?.history
-  );
+  const history = historyOf(body.state?.session?.history);
 
   if (!q) {
     return res.status(200).json(
-      response('Привет! О чём поговорим?', history)
+      alice('Привет! Слушаю тебя.', history)
     );
   }
 
-  const needsSearch = searchNeeded(q, history);
+  let answer = '';
+  let searchData = null;
+  let searchUsed = false;
 
-  let result;
-  let searchContext = '';
-  let searchError = false;
-
-  if (needsSearch) {
+  // Точные данные: прямые источники
+  if (isCurrency(q) || isLocalWeather(q)) {
     try {
-      searchContext = await getSearch(
-        q,
-        Math.min(
-          SEARCH_MS,
-          Math.max(200, timeLeft(started) - 2350)
-        )
-      );
+      answer = isCurrency(q)
+        ? await currency(q)
+        : await localWeather();
+
+      console.info('Direct data OK', Date.now() - started);
     } catch (e) {
-      searchError = true;
+      console.warn('Direct data error', e.name, e.message);
+
+      // Если прямой источник недоступен, продолжим поиск
+      answer = '';
     }
   }
 
-  if (needsSearch && !searchContext) {
-    result =
-      'Сейчас не удалось получить свежие данные из интернета. ' +
-      'Могу ответить на общий вопрос или попробуй повторить запрос.';
-  } else {
+  // Свежие данные: Serper + Gemini
+  if (!answer && needsSearch(q, history)) {
+    searchUsed = true;
+
     try {
-      result = await getGemini(
+      searchData = await serper(
+        q,
+        Math.min(SEARCH_MS, Math.max(200, remaining() - 2600))
+      );
+
+      console.info('Serper OK', Date.now() - started);
+    } catch (e) {
+      console.warn(
+        'Serper failure',
+        e.name,
+        e.message,
+        Date.now() - started
+      );
+    }
+
+    if (searchData) {
+      try {
+        answer = await gemini(
+          q,
+          history,
+          extractSearch(searchData),
+          Math.min(GEMINI_MS, Math.max(200, remaining() - 350))
+        );
+      } catch (e) {
+        console.warn(
+          'Gemini search failure',
+          e.name,
+          e.message
+        );
+
+        answer = usefulFallback(searchData);
+      }
+    } else {
+      answer = 'Сейчас не удалось получить свежие данные из интернета. Попробуй повторить запрос.';
+    }
+  }
+
+  // Обычные вопросы: Gemini
+  if (!answer && !searchUsed) {
+    try {
+      answer = await gemini(
         q,
         history,
-        searchContext,
-        Math.min(
-          GEMINI_MS,
-          Math.max(200, timeLeft(started) - 330)
-        )
+        '',
+        Math.min(GEMINI_MS, Math.max(200, remaining() - 350))
       );
     } catch (e) {
-      if (needsSearch) {
-        result =
-          'Я нашла сведения в интернете, но не успела ' +
-          'их надёжно обработать. Попробуй уточнить вопрос.';
-      } else if (e.message === 'GEMINI_KEY_MISSING') {
-        result = 'В Vercel не настроен ключ Gemini.';
-      } else {
-        result =
-          'Нейросеть не успела ответить. ' +
-          'Повтори вопрос, пожалуйста.';
-      }
+      console.warn(
+        'Gemini chat failure',
+        e.name,
+        e.message
+      );
+
+      answer = e.message === 'GEMINI_KEY_MISSING'
+        ? 'Не настроен ключ Gemini в Vercel.'
+        : 'Сейчас не получилось ответить. Повтори вопрос, пожалуйста.';
     }
   }
 
-  console.info(
-    'Alice completed',
-    Date.now() - started,
-    'ms',
-    { needsSearch, searchError }
-  );
+  console.info('Alice completed', Date.now() - started, {
+    searchUsed,
+    hasSearchData: !!searchData,
+    model: MODEL
+  });
 
   return res.status(200).json(
-    response(result, [
+    alice(answer, [
       ...history,
       { role: 'user', text: q },
-      { role: 'model', text: result }
+      { role: 'model', text: answer }
     ])
   );
 }

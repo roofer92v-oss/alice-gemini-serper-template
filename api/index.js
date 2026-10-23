@@ -164,14 +164,123 @@ function isLocalWeather(q) {
     && /мончегорск/i.test(q);
 }
 
-async function localWeather() {
-  const url = 'https://api.open-meteo.com/v1/forecast?' +
-    new URLSearchParams({
-      latitude: '67.94',
-      longitude: '32.87',
-      current: 'temperature_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m',
-      timezone: 'Europe/Moscow'
-    });
+async function localWeather() 
+async function localWeather(question = '') {
+  const forecast = /завтра|недел|выходн|когда|будет|ожида|прогноз|дн[яиё]|снег/i.test(question);
+
+  const params = new URLSearchParams({
+    latitude: '67.94',
+    longitude: '32.87',
+    timezone: 'Europe/Moscow',
+    current: 'temperature_2m,apparent_temperature,weather_code,wind_speed_10m',
+    daily: 'snowfall_sum,temperature_2m_max,temperature_2m_min,weather_code',
+    forecast_days: '7'
+  });
+
+  const r = await timedFetch(
+    'https://api.open-meteo.com/v1/forecast?' + params,
+    {},
+    DIRECT_MS
+  );
+
+  const data = await r.json();
+
+  if (!forecast) {
+    const c = data.current;
+    if (!c || !Number.isFinite(c.temperature_2m)) {
+      throw new Error('WEATHER_INVALID_DATA');
+    }
+
+    return `В Мончегорске сейчас ${Math.round(c.temperature_2m)} градусов, ${weatherCode(c.weather_code)}. По ощущениям ${Math.round(c.apparent_temperature)}. Ветер около ${Math.round(c.wind_speed_10m)} километров в час.`;
+  }
+
+  const daily = data.daily;
+  if (!Array.isArray(daily?.time)) {
+    throw new Error('FORECAST_INVALID_DATA');
+  }
+
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Moscow',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short'
+  }).formatToParts(now);
+
+  const part = type =>
+    parts.find(x => x.type === type)?.value;
+
+  const today = `${part('year')}-${part('month')}-${part('day')}`;
+  const dayNumber = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+    .indexOf(part('weekday'));
+
+  const todayUTC = Date.parse(today + 'T00:00:00Z');
+
+  const offset = /завтра/i.test(question) ? 1 : 0;
+
+  let endOffset = 6;
+
+  if (/этой недел/i.test(question)) {
+    endOffset = 6 - dayNumber;
+  } else if (/выходн/i.test(question)) {
+    endOffset = 6 - dayNumber;
+  }
+
+  const items = daily.time.map((date, i) => ({
+    date,
+    offset: Math.round(
+      (Date.parse(date + 'T00:00:00Z') - todayUTC) / 86400000
+    ),
+    snow: Number(daily.snowfall_sum?.[i] || 0),
+    min: daily.temperature_2m_min?.[i],
+    max: daily.temperature_2m_max?.[i]
+  })).filter(x => x.offset >= offset && x.offset <= endOffset);
+
+  if (/выходн/i.test(question)) {
+    const saturday = 5 - dayNumber;
+    const sunday = 6 - dayNumber;
+    const weekend = items.filter(x =>
+      x.offset === saturday || x.offset === sunday
+    );
+    items.splice(0, items.length, ...weekend);
+  }
+
+  if (!items.length) {
+    return 'Прогноз на этот период пока недоступен.';
+  }
+
+  const snowy = items.filter(x => x.snow > 0);
+
+  const dayName = date => {
+    const [y, m, d] = date.split('-').map(Number);
+    return new Intl.DateTimeFormat('ru-RU', {
+      timeZone: 'UTC',
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long'
+    }).format(new Date(Date.UTC(y, m - 1, d)));
+  };
+
+  if (/температур|сколько градус/i.test(question) &&
+      !/снег|осадк/i.test(question)) {
+    const entries = items.slice(0, 3).map(x =>
+      `${dayName(x.date)}: от ${Math.round(x.min)} до ${Math.round(x.max)} градусов`
+    );
+    return 'Прогноз для Мончегорска: ' + entries.join('; ') + '.';
+  }
+
+  if (snowy.length) {
+    const entries = snowy.slice(0, 3).map(x =>
+      `${dayName(x.date)} — около ${x.snow.toFixed(1).replace('.', ',')} сантиметра`
+    );
+
+    return `Да, по прогнозу в Мончегорске ожидается снег. ${entries.join('; ')}. Прогноз может измениться.`;
+  }
+
+  return 'По текущему прогнозу Open-Meteo, в указанный период снег в Мончегорске не ожидается. Прогноз ещё может измениться.';
+}
+);
 
   const r = await timedFetch(url, {}, DIRECT_MS);
   const data = await r.json();
@@ -384,7 +493,18 @@ export default async function handler(req, res) {
   let searchUsed = false;
 
   // Точные данные: прямые источники
-  if (isCurrency(q) || isLocalWeather(q)) {
+  const previousWeather = history.some(x =>
+  x.role === 'user' &&
+  /мончегорск/i.test(x.text) &&
+  /погод|снег|температур|осадк/i.test(x.text)
+);
+
+const weatherRequest =
+  isLocalWeather(q) ||
+  (previousWeather &&
+   /завтра|недел|выходн|снег|погод|температур|когда|будет/i.test(q));
+
+if (isCurrency(q) || weatherRequest) {
     try {
       answer = isCurrency(q)
         ? await currency(q)
